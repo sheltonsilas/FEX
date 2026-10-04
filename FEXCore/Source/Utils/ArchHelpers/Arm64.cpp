@@ -704,6 +704,19 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
    * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
    * can fault despite correct alignment. Report what the region actually is, so "guest
    * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
+  /* The host query below exists on only one of this file's two builds, and on the other
+   * it would be the wrong question anyway.
+   *
+   * This TU is compiled twice: into the arm64ec PE under llvm-mingw, where _WIN32 is
+   * defined and VirtualQuery is the real host API, and for the Darwin host, where Win32
+   * declares no such type or function and this file did not compile at all.
+   *
+   * On the Darwin side ml276 already settled that VirtualQuery is not the tool: it reports
+   * WINE's view, in which pool addresses come back MEM_RESERVE/PAGE_NOACCESS with
+   * AllocationBase 0 -- the same trap that made [guest-rip] print "NOT COMMITTED" for pool
+   * addresses. Answer ml223's question -- dual-mapped pool page, or ordinary memory --
+   * from the pool bounds instead, the same env vars ml276 reads. */
+#ifdef _WIN32
   MEMORY_BASIC_INFORMATION mbi {};
   const char* type = "?";
   if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
@@ -714,6 +727,24 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
                     (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
                     mbi.Protect, type, mbi.State);
+#else
+  static uint64_t PoolRx = 0;
+  static uint64_t PoolSize = 0;
+  static bool PoolProbed = false;
+  if (!PoolProbed) {
+    PoolProbed = true;
+    const char* RxEnv = getenv("WINE_IOS_JIT_RX");
+    const char* SzEnv = getenv("WINE_IOS_JIT_SIZE");
+    PoolRx = RxEnv ? strtoull(RxEnv, nullptr, 16) : 0;
+    PoolSize = SzEnv ? strtoull(SzEnv, nullptr, 16) : 0;
+  }
+  const uint64_t Addr = GPRs[AddressReg];
+  const bool InPool = PoolRx && PoolSize && Addr >= PoolRx && Addr < PoolRx + PoolSize;
+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                    "crosses16B={} | place={} (pool RX {} size {:#x})",
+                    Size, AddressReg, Addr, Addr & 15, (Addr & 15) ? "yes" : "no",
+                    InPool ? "dual-mapped-pool" : "not-pool", PoolRx, PoolSize);
+#endif
 }
 
 static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
